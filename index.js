@@ -22,7 +22,17 @@ bot.onText(QUEST_COMMAND, async msg => {
 		const response = formatQuestion(question);
 		await bot.sendMessage(msg.chat.id, response, {
 			parse_mode: "HTML",
-			disable_web_page_preview: true
+			disable_web_page_preview: true,
+			reply_markup: {
+				inline_keyboard: [
+					[
+						{
+							text: "Удалить вопрос",
+							callback_data: "delete_question"
+						}
+					]
+				]
+			}
 		});
 	} catch (error) {
 		console.error("Failed to send question", error);
@@ -42,6 +52,23 @@ bot.onText(/\/start/i, msg => {
 			: "Напиши /quest, чтобы получить новый вопрос."
 	];
 	bot.sendMessage(msg.chat.id, help.join("\n"));
+});
+
+bot.on("callback_query", async query => {
+	if (query.data !== "delete_question" || !query.message) {
+		return bot.answerCallbackQuery(query.id);
+	}
+
+	try {
+		await bot.deleteMessage(query.message.chat.id, query.message.message_id);
+		await bot.answerCallbackQuery(query.id);
+	} catch (error) {
+		console.error("Failed to delete message", error);
+		await bot.answerCallbackQuery(query.id, {
+			text: "Не получилось удалить сообщение.",
+			show_alert: true
+		});
+	}
 });
 
 bot.on("polling_error", console.error);
