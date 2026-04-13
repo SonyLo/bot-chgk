@@ -1,6 +1,11 @@
 const TelegramBot = require("node-telegram-bot-api");
 const { openDb } = require("./db");
 const { fetchRandomQuestion, formatQuestionForUser, formatQuestionForAdmins } = require("./chgk");
+const { checkAnswer } = require("./ai");
+
+// храним данные вопроса чтобы потом проверять ответы
+const questionStorage = new Map();   // key -> { questionText, answer, accept }
+const pendingAnswers = new Map();    // `${chatId}:${userId}` -> questionData
 
 const API_KEY_BOT = process.env.TELEGRAM_TOKEN;
 if (!API_KEY_BOT) {
@@ -90,14 +95,33 @@ bot.onText(QUEST_COMMAND, async msg => {
 
 		// 1) вопрос в чат (без ответов)
 		const userText = formatQuestionForUser(question);
+		// const sentQuestion = await bot.sendMessage(msg.chat.id, userText, {
+		// 	parse_mode: "HTML",
+		// 	disable_web_page_preview: true,
+		// 	reply_markup: {
+		// 		inline_keyboard: [[{ text: "Удалить вопрос", callback_data: "delete_question" }]]
+		// 	}
+		// });
 		const sentQuestion = await bot.sendMessage(msg.chat.id, userText, {
 			parse_mode: "HTML",
 			disable_web_page_preview: true,
 			reply_markup: {
-				inline_keyboard: [[{ text: "Удалить вопрос", callback_data: "delete_question" }]]
+				inline_keyboard: [[
+					{ text: "Проверить ответ", callback_data: "check_answer" },
+					{ text: "Удалить вопрос", callback_data: "delete_question" }
+				]]
 			}
 		});
-
+		const qKey = makeKey(sentQuestion.chat.id, sentQuestion.message_id);
+		questionStorage.set(qKey, {
+			questionText: question.questionText,
+			answer: question.answer,
+			accept: question.accept
+		});
+		if (questionStorage.size > MAX_LINKS) {
+			const firstKey = questionStorage.keys().next().value;
+			questionStorage.delete(firstKey);
+		}
 		// 2) админам этого чата — ответ
 		const enabled = await db.isEnabledForChat(msg.chat.id);
 		if (!enabled) return;
@@ -160,6 +184,32 @@ bot.on("callback_query", async query => {
 		last_name: query.from?.last_name || null,
 		ok: 1
 	});
+
+	if (query.data === "check_answer") {
+		const chatId = query.message.chat.id;
+		const msgId = query.message.message_id;
+		const qKey = makeKey(chatId, msgId);
+		const questionData = questionStorage.get(qKey);
+
+		if (!questionData) {
+			return bot.answerCallbackQuery(query.id, {
+				text: "Вопрос уже протух, запроси новый",
+				show_alert: true
+			});
+		}
+
+		const stateKey = `${chatId}:${query.from.id}`;
+		pendingAnswers.set(stateKey, { ...questionData, originalMsgId: msgId });
+
+		await bot.answerCallbackQuery(query.id);
+		await bot.sendMessage(chatId,
+			`${query.from.first_name || "Игрок"}, пиши свой ответ:`,
+			{ reply_to_message_id: msgId }
+		);
+		return;
+	}
+
+
 	if (query.data !== "delete_question" || !query.message) {
 		return bot.answerCallbackQuery(query.id);
 	}
@@ -228,6 +278,85 @@ bot.onText(/^\/stats(?:\s+(\d+))?$/i, async (msg, m) => {
 	return bot.sendMessage(msg.chat.id, lines.join("\n"));
 });
 
+// bot.on("message", async msg => {
+// 	if (!msg.text || msg.text.startsWith("/")) return;
+
+// 	const stateKey = `${msg.chat.id}:${msg.from.id}`;
+// 	const pending = pendingAnswers.get(stateKey);
+// 	if (!pending) return;
+
+// 	pendingAnswers.delete(stateKey);
+
+// 	try {
+// 		const result = await checkAnswer({
+// 			questionText: pending.questionText,
+// 			correctAnswer: pending.answer,
+// 			accept: pending.accept,
+// 			userAnswer: msg.text
+// 		});
+
+// 		const emoji = { yes: "✅", close: "🤔", no: "❌" }[result.verdict] ?? "❓";
+// 		await bot.sendMessage(msg.chat.id,
+// 			`${emoji} ${result.comment || "Не смог оценить ответ"}`,
+// 			{ reply_to_message_id: msg.message_id }
+// 		);
+// 	} catch (e) {
+// 		console.error("AI check failed", e);
+// 		await bot.sendMessage(msg.chat.id, "Не смог проверить ответ, попробуй ещё раз.",
+// 			{ reply_to_message_id: msg.message_id }
+// 		);
+// 	}
+// });
+bot.on("message", async msg => {
+	if (!msg.text || msg.text.startsWith("/")) return;
+
+	const stateKey = `${msg.chat.id}:${msg.from.id}`;
+	const pending = pendingAnswers.get(stateKey);
+	if (!pending) return;
+
+	// сдаюсь — раскрыть ответ
+	if (/сдаюсь/i.test(msg.text.trim())) {
+		pendingAnswers.delete(stateKey);
+		await bot.sendMessage(msg.chat.id,
+			`💡 Правильный ответ: ${pending.answer}${pending.accept ? `\nЗачёт: ${pending.accept}` : ""}`,
+			{ reply_to_message_id: msg.message_id }
+		);
+		return;
+	}
+
+	// увеличить счётчик попыток
+	pending.attempts = (pending.attempts || 0) + 1;
+	pendingAnswers.set(stateKey, pending);
+
+	try {
+		const result = await checkAnswer({
+			questionText: pending.questionText,
+			correctAnswer: pending.answer,
+			accept: pending.accept,
+			userAnswer: msg.text,
+			attempts: pending.attempts
+		});
+
+		if (result.verdict === "yes") {
+			pendingAnswers.delete(stateKey);
+		}
+
+		const emoji = { yes: "✅", close: "🤔", no: "❌" }[result.verdict] ?? "❓";
+		const hint = result.verdict !== "yes"
+			? "\n\n💬 Напиши ещё раз или <i>сдаюсь</i>"
+			: "";
+
+		await bot.sendMessage(msg.chat.id,
+			`${emoji} ${result.comment}${hint}`,
+			{ reply_to_message_id: msg.message_id, parse_mode: "HTML" }
+		);
+	} catch (e) {
+		console.error("AI check failed", e);
+		await bot.sendMessage(msg.chat.id, "Не смог проверить ответ, попробуй ещё раз.",
+			{ reply_to_message_id: msg.message_id }
+		);
+	}
+});
 // ===== Админка по чатам =====
 
 // в чате: выбрать текущий чат для настройки в личке

@@ -1,10 +1,39 @@
 const https = require("https");
 const { JSDOM } = require("jsdom");
 
-function fetchRandomQuestion() {
+const SKIP_PATTERNS = [
+	/раздат/i,
+	/на фото/i,
+	/на рисунк/i,
+	/на картинк/i,
+	/на иллюстрац/i,
+	/перед вами/i,
+	/в конверт/i,
+	/на экран/i,
+	/аудио/i,
+	/видео/i,
+	/прослушайте/i,
+	/посмотрите/i,
+];
+
+function isVisualQuestion(questionText) {
+	return SKIP_PATTERNS.some(p => p.test(questionText));
+}
+
+async function fetchRandomQuestion(maxRetries = 5) {
+	for (let i = 0; i < maxRetries; i++) {
+		const question = await fetchOnce();
+		if (!isVisualQuestion(question.questionText)) return question;
+		console.log("Skipped visual question, retrying...");
+	}
+	throw new Error("Не смог найти подходящий вопрос");
+}
+
+
+function fetchOnce() {
 	return new Promise((resolve, reject) => {
 		https
-			.get("https://db.chgk.info/random/limit1", res => {
+			.get("https://db.chgk.info/random/complexity2/limit1", res => {
 				let body = "";
 				res.on("data", chunk => (body += chunk));
 				res.on("end", () => {
